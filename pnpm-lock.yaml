@@ -203,7 +203,7 @@ importers:
   sdk/packages/node/iii:
     dependencies:
       '@iii-dev/helpers':
-        specifier: workspace:*
+        specifier: 0.22.0
         version: link:../helpers
       '@opentelemetry/api':
         specifier: ^1.9.0
