@@ -107,7 +107,10 @@ mod tests {
 
     use super::*;
     use crate::workers::{
-        state::{StateWorker, adapters::StateAdapter, config::StateModuleConfig},
+        state::{
+            StateWorker, adapters::StateAdapter, config::StateModuleConfig,
+            structs::StateListPageResult,
+        },
         traits::ConfigurableWorker,
     };
 
@@ -150,6 +153,18 @@ mod tests {
 
         async fn list(&self, _scope: &str) -> anyhow::Result<Vec<serde_json::Value>> {
             Ok(Vec::new())
+        }
+
+        async fn list_page(
+            &self,
+            _scope: &str,
+            _cursor: Option<&str>,
+            _limit: usize,
+        ) -> anyhow::Result<StateListPageResult> {
+            Ok(StateListPageResult {
+                items: Vec::new(),
+                next_cursor: None,
+            })
         }
 
         async fn list_groups(&self) -> anyhow::Result<Vec<String>> {

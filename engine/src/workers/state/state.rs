@@ -29,8 +29,8 @@ use crate::{
             configuration,
             structs::{
                 StateDeleteInput, StateEventData, StateEventType, StateGetGroupInput,
-                StateGetInput, StateListGroupsInput, StateListGroupsResult, StateSetInput,
-                StateUpdateInput,
+                StateGetInput, StateListGroupsInput, StateListGroupsResult, StateListPageInput,
+                StateListPageResult, StateSetInput, StateUpdateInput,
             },
             trigger::{StateTrigger, StateTriggers, TRIGGER_TYPE},
         },
@@ -738,6 +738,36 @@ impl StateWorker {
         }
     }
 
+    #[function(
+        id = "state::list-page",
+        description = "List a bounded page of keyed state values with weak consistency"
+    )]
+    pub async fn list_page(
+        &self,
+        input: StateListPageInput,
+    ) -> FunctionResult<StateListPageResult, ErrorBody> {
+        let limit = input.limit.unwrap_or(100);
+        if !(1..=1000).contains(&limit) {
+            return FunctionResult::Failure(ErrorBody {
+                message: "limit must be an integer between 1 and 1000".to_string(),
+                code: "LIST_PAGE_ERROR".to_string(),
+                stacktrace: None,
+            });
+        }
+        match self
+            .adapter
+            .list_page(&input.scope, input.cursor.as_deref(), limit)
+            .await
+        {
+            Ok(page) => FunctionResult::Success(page),
+            Err(e) => FunctionResult::Failure(ErrorBody {
+                message: format!("Failed to list page: {}", e),
+                code: "LIST_PAGE_ERROR".to_string(),
+                stacktrace: None,
+            }),
+        }
+    }
+
     #[function(id = "state::list_groups", description = "List all state groups")]
     pub async fn list_groups(
         &self,
@@ -778,7 +808,10 @@ mod tests {
         observability::metrics::ensure_default_meter,
         state::adapters::kv_store::BuiltinKvStoreAdapter,
     };
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
 
     #[test]
     fn state_trigger_matches_respects_scope_and_key() {
@@ -836,12 +869,16 @@ mod tests {
         delete_error: Option<&'static str>,
         update_error: Option<&'static str>,
         list_error: Option<&'static str>,
+        list_page_error: Option<&'static str>,
         list_groups_error: Option<&'static str>,
         destroy_error: Option<&'static str>,
         set_result: StreamSetResult,
         get_result: Option<Value>,
         update_result: StreamUpdateResult,
         list_values: Vec<Value>,
+        list_page_result: StateListPageResult,
+        list_page_limit: AtomicUsize,
+        list_page_cursor: Mutex<Option<String>>,
         groups: Vec<String>,
         destroy_called: AtomicBool,
     }
@@ -854,6 +891,7 @@ mod tests {
                 delete_error: None,
                 update_error: None,
                 list_error: None,
+                list_page_error: None,
                 list_groups_error: None,
                 destroy_error: None,
                 set_result: StreamSetResult {
@@ -867,6 +905,12 @@ mod tests {
                     errors: Vec::new(),
                 },
                 list_values: Vec::new(),
+                list_page_result: StateListPageResult {
+                    items: Vec::new(),
+                    next_cursor: None,
+                },
+                list_page_limit: AtomicUsize::new(0),
+                list_page_cursor: Mutex::new(None),
                 groups: Vec::new(),
                 destroy_called: AtomicBool::new(false),
             }
@@ -917,6 +961,20 @@ mod tests {
             match self.list_error {
                 Some(message) => Err(anyhow::anyhow!(message)),
                 None => Ok(self.list_values.clone()),
+            }
+        }
+
+        async fn list_page(
+            &self,
+            _scope: &str,
+            cursor: Option<&str>,
+            limit: usize,
+        ) -> anyhow::Result<StateListPageResult> {
+            self.list_page_limit.store(limit, Ordering::Relaxed);
+            *self.list_page_cursor.lock().unwrap() = cursor.map(String::from);
+            match self.list_page_error {
+                Some(message) => Err(anyhow::anyhow!(message)),
+                None => Ok(self.list_page_result.clone()),
             }
         }
 
@@ -1271,6 +1329,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_list_page_defaults_limit_and_returns_empty_final_page() {
+        let adapter = Arc::new(FakeStateAdapter::default());
+        let (_engine, module) = setup_with_adapter(adapter.clone());
+
+        let result = module
+            .list_page(StateListPageInput {
+                scope: "scope".to_string(),
+                cursor: None,
+                limit: None,
+            })
+            .await;
+
+        assert!(
+            matches!(result, FunctionResult::Success(StateListPageResult { items, next_cursor: None }) if items.is_empty())
+        );
+        assert_eq!(adapter.list_page_limit.load(Ordering::Relaxed), 100);
+    }
+
+    #[tokio::test]
+    async fn test_list_page_accepts_limit_bounds_and_cursor() {
+        for limit in [1, 1000] {
+            let adapter = Arc::new(FakeStateAdapter::default());
+            let (_engine, module) = setup_with_adapter(adapter.clone());
+            let result = module
+                .list_page(StateListPageInput {
+                    scope: "scope".to_string(),
+                    cursor: Some("cursor".to_string()),
+                    limit: Some(limit),
+                })
+                .await;
+            assert!(matches!(result, FunctionResult::Success(_)));
+            assert_eq!(adapter.list_page_limit.load(Ordering::Relaxed), limit);
+            assert_eq!(
+                adapter.list_page_cursor.lock().unwrap().as_deref(),
+                Some("cursor")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_page_accepts_explicit_empty_cursor() {
+        let adapter = Arc::new(FakeStateAdapter::default());
+        let (_engine, module) = setup_with_adapter(adapter.clone());
+
+        let result = module
+            .list_page(StateListPageInput {
+                scope: "scope".to_string(),
+                cursor: Some(String::new()),
+                limit: Some(1),
+            })
+            .await;
+
+        assert!(matches!(result, FunctionResult::Success(_)));
+        assert_eq!(
+            adapter.list_page_cursor.lock().unwrap().as_deref(),
+            Some("")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_page_rejects_invalid_limits() {
+        for limit in [0, 1001] {
+            let (_engine, module) = setup();
+            let result = module
+                .list_page(StateListPageInput {
+                    scope: "scope".to_string(),
+                    cursor: None,
+                    limit: Some(limit),
+                })
+                .await;
+            assert!(
+                matches!(result, FunctionResult::Failure(err) if err.code == "LIST_PAGE_ERROR")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_list_groups() {
         let (_engine, module) = setup();
 
@@ -1602,6 +1737,25 @@ mod tests {
             FunctionResult::Failure(err) => assert_eq!(err.code, "LIST_ERROR"),
             _ => panic!("expected list failure"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_list_page_returns_failure_when_adapter_errors() {
+        let adapter = Arc::new(FakeStateAdapter {
+            list_page_error: Some("page exploded"),
+            ..Default::default()
+        });
+        let (_engine, module) = setup_with_adapter(adapter);
+
+        let result = module
+            .list_page(StateListPageInput {
+                scope: "scope".to_string(),
+                cursor: None,
+                limit: None,
+            })
+            .await;
+
+        assert!(matches!(result, FunctionResult::Failure(err) if err.code == "LIST_PAGE_ERROR"));
     }
 
     #[tokio::test]

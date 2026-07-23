@@ -4,6 +4,8 @@ import type {
   StateDeleteResult,
   StateGetInput,
   StateListInput,
+  StateListPageInput,
+  StateListPageResult,
   StateSetInput,
   StateSetResult,
   StateUpdateInput,
@@ -19,6 +21,8 @@ export const state: IState = {
   delete: (input: StateDeleteInput): Promise<StateDeleteResult> =>
     iii.trigger({ function_id: 'state::delete', payload: input }),
   list: <TData>(input: StateListInput): Promise<TData[]> => iii.trigger({ function_id: 'state::list', payload: input }),
+  listPage: <TData>(input: StateListPageInput): Promise<StateListPageResult<TData>> =>
+    iii.trigger({ function_id: 'state::list-page', payload: input }),
   update: <TData>(input: StateUpdateInput): Promise<StateUpdateResult<TData> | null> =>
     iii.trigger({ function_id: 'state::update', payload: input }),
 }

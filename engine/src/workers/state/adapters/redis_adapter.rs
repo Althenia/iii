@@ -19,9 +19,177 @@ use crate::{
         state::{
             adapters::StateAdapter,
             registry::{StateAdapterFuture, StateAdapterRegistration},
+            structs::{StateListPageItem, StateListPageResult},
         },
     },
 };
+
+const STATE_SET_SCRIPT: &str = r#"
+    local field = ARGV[1]
+    local old_value = redis.call('HGET', KEYS[1], field)
+    redis.call('HSET', KEYS[1], field, ARGV[2])
+    local active_index = redis.call('GET', KEYS[2])
+    if active_index then
+        redis.call('ZADD', active_index, 0, field)
+    end
+    if redis.call('EXISTS', KEYS[3]) == 1 then
+        redis.call('ZADD', KEYS[4], 0, field)
+        redis.call('ZADD', KEYS[5], 0, field)
+    end
+    return old_value
+"#;
+
+const STATE_DELETE_SCRIPT: &str = r#"
+    local field = ARGV[1]
+    redis.call('HDEL', KEYS[1], field)
+    local active_index = redis.call('GET', KEYS[2])
+    if active_index then
+        redis.call('ZREM', active_index, field)
+    end
+    if redis.call('EXISTS', KEYS[3]) == 1 then
+        redis.call('ZREM', KEYS[4], field)
+        redis.call('ZREM', KEYS[5], field)
+    end
+    return 1
+"#;
+
+const STATE_LIST_PAGE_SCRIPT: &str = r#"
+    local active_index = redis.call('GET', KEYS[2])
+    if not active_index then
+        return {'false', '0', '', 'state pagination index is not ready'}
+    end
+    local lower = '-'
+    if ARGV[1] == '1' then
+        lower = '(' .. ARGV[2]
+    end
+    local limit = tonumber(ARGV[3])
+    local keys = redis.call('ZRANGEBYLEX', active_index, lower, '+', 'LIMIT', 0, limit + 1)
+    local result = {'true', '0', ''}
+    if #keys > limit then
+        result[2] = '1'
+        result[3] = keys[limit]
+    end
+    local count = math.min(#keys, limit)
+    for i = 1, count do
+        local value = redis.call('HGET', KEYS[1], keys[i])
+        if not value then
+            return {'false', '0', '', 'state pagination index does not match canonical hash'}
+        end
+        result[#result + 1] = keys[i]
+        result[#result + 1] = value
+    end
+    return result
+"#;
+
+const STATE_RECONCILE_SCRIPT: &str = r#"
+    if redis.call('GET', KEYS[2]) == KEYS[5] and redis.call('EXISTS', KEYS[3]) == 0 then
+        return {'ready'}
+    end
+
+    local phase = redis.call('GET', KEYS[3])
+    if not phase then
+        phase = 'build'
+        redis.call('SET', KEYS[3], phase)
+        redis.call('SET', KEYS[4], '0')
+        redis.call('DEL', KEYS[5], KEYS[6])
+    end
+
+    local cursor = redis.call('GET', KEYS[4]) or '0'
+    local scan = redis.call('HSCAN', KEYS[1], cursor, 'COUNT', 1000)
+    local target = phase == 'build' and KEYS[5] or KEYS[6]
+    local entries = scan[2]
+    for i = 1, #entries, 2 do
+        redis.call('ZADD', target, 0, entries[i])
+    end
+    redis.call('SET', KEYS[4], scan[1])
+    if scan[1] ~= '0' then
+        return {'building'}
+    end
+
+    if phase == 'build' then
+        redis.call('SET', KEYS[3], 'verify')
+        redis.call('SET', KEYS[4], '0')
+        return {'building'}
+    end
+
+    local hash_count = redis.call('HLEN', KEYS[1])
+    local build_count = redis.call('ZCARD', KEYS[5])
+    local verify_count = redis.call('ZCARD', KEYS[6])
+    local build_only = redis.call('ZDIFF', 2, KEYS[5], KEYS[6])
+    local verify_only = redis.call('ZDIFF', 2, KEYS[6], KEYS[5])
+    if hash_count ~= build_count or build_count ~= verify_count or #build_only ~= 0 or #verify_only ~= 0 then
+        redis.call('DEL', KEYS[5], KEYS[6])
+        redis.call('SET', KEYS[3], 'build')
+        redis.call('SET', KEYS[4], '0')
+        return {'building'}
+    end
+
+    redis.call('SET', KEYS[2], KEYS[5])
+    redis.call('DEL', KEYS[3], KEYS[4], KEYS[6])
+    return {'ready'}
+"#;
+
+struct StateKeys {
+    hash: String,
+    active: String,
+    phase: String,
+    cursor: String,
+    target: String,
+    verify: String,
+}
+
+fn state_keys(scope: &str) -> StateKeys {
+    StateKeys {
+        hash: format!("state:{scope}"),
+        active: format!("iii:state-index-active:{scope}"),
+        phase: format!("iii:state-index-phase:{scope}"),
+        cursor: format!("iii:state-index-cursor:{scope}"),
+        target: format!("iii:state-index:{scope}:v1"),
+        verify: format!("iii:state-index-verify:{scope}"),
+    }
+}
+
+fn state_json_update_script() -> String {
+    JSON_UPDATE_SCRIPT.replacen(
+        "redis.call('HSET', key, field, new_value_str)",
+        r#"redis.call('HSET', key, field, new_value_str)
+    local active_index = redis.call('GET', KEYS[2])
+    if active_index then
+        redis.call('ZADD', active_index, 0, field)
+    end
+    if redis.call('EXISTS', KEYS[3]) == 1 then
+        redis.call('ZADD', KEYS[4], 0, field)
+        redis.call('ZADD', KEYS[5], 0, field)
+    end"#,
+        1,
+    )
+}
+
+fn decode_list_page_reply(values: Vec<String>) -> anyhow::Result<StateListPageResult> {
+    if values.len() < 3 {
+        anyhow::bail!("Unexpected return value from state pagination script")
+    }
+    if values[0] != "true" {
+        anyhow::bail!(
+            "Failed to list state page: {}",
+            values.get(3).map_or("unknown error", String::as_str)
+        )
+    }
+    if (values.len() - 3) % 2 != 0 {
+        anyhow::bail!("Unexpected return value from state pagination script")
+    }
+
+    let next_cursor = (values[1] == "1").then(|| values[2].clone());
+    let mut items = Vec::with_capacity((values.len() - 3) / 2);
+    for pair in values[3..].chunks_exact(2) {
+        items.push(StateListPageItem {
+            key: pair[0].clone(),
+            value: serde_json::from_str(&pair[1])
+                .map_err(|e| anyhow::anyhow!("Failed to deserialize paged state value: {}", e))?,
+        });
+    }
+    Ok(StateListPageResult { items, next_cursor })
+}
 
 pub struct StateRedisAdapter {
     publisher: Arc<Mutex<ConnectionManager>>,
@@ -52,23 +220,19 @@ impl StateRedisAdapter {
 #[async_trait]
 impl StateAdapter for StateRedisAdapter {
     async fn set(&self, scope: &str, key: &str, value: Value) -> anyhow::Result<StreamSetResult> {
-        let scope_key: String = format!("state:{}", scope);
+        let keys = state_keys(scope);
         let mut conn = self.publisher.lock().await;
         let serialized = serde_json::to_string(&value)
             .map_err(|e| anyhow::anyhow!("Failed to serialize value: {}", e))?;
 
-        // Use Lua script for atomic get-and-set operation
-        // This script atomically gets the old value and sets the new value
-        let script = redis::Script::new(
-            r#"
-                local old_value = redis.call('HGET', KEYS[1], ARGV[1])
-                redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
-                return old_value
-            "#,
-        );
+        let script = redis::Script::new(STATE_SET_SCRIPT);
 
         let result: redis::RedisResult<Option<String>> = script
-            .key(&scope_key)
+            .key(&keys.hash)
+            .key(&keys.active)
+            .key(&keys.phase)
+            .key(&keys.target)
+            .key(&keys.verify)
             .arg(key)
             .arg(&serialized)
             .invoke_async(&mut *conn)
@@ -93,7 +257,7 @@ impl StateAdapter for StateRedisAdapter {
     }
 
     async fn get(&self, scope: &str, key: &str) -> anyhow::Result<Option<Value>> {
-        let scope_key = format!("state:{}", scope);
+        let scope_key = state_keys(scope).hash;
         let mut conn = self.publisher.lock().await;
 
         match conn.hget::<_, _, Option<String>>(&scope_key, &key).await {
@@ -112,17 +276,22 @@ impl StateAdapter for StateRedisAdapter {
         ops: Vec<UpdateOp>,
     ) -> anyhow::Result<StreamUpdateResult> {
         let mut conn = self.publisher.lock().await;
-        let scope_key = format!("state:{}", scope);
+        let keys = state_keys(scope);
 
         // Serialize operations to JSON
         let ops_json = serde_json::to_string(&ops)
             .map_err(|e| anyhow::anyhow!("Failed to serialize update operations: {}", e))?;
 
         // Use a single Lua script that atomically gets, applies operations, and sets.
-        let script = redis::Script::new(JSON_UPDATE_SCRIPT);
+        let update_script = state_json_update_script();
+        let script = redis::Script::new(&update_script);
 
         let result: redis::RedisResult<Vec<String>> = script
-            .key(&scope_key)
+            .key(&keys.hash)
+            .key(&keys.active)
+            .key(&keys.phase)
+            .key(&keys.target)
+            .key(&keys.verify)
             .arg(key)
             .arg(&ops_json)
             .invoke_async(&mut *conn)
@@ -178,10 +347,17 @@ impl StateAdapter for StateRedisAdapter {
     }
 
     async fn delete(&self, scope: &str, key: &str) -> anyhow::Result<()> {
-        let scope_key = format!("state:{}", scope);
+        let keys = state_keys(scope);
         let mut conn = self.publisher.lock().await;
 
-        conn.hdel::<_, String, ()>(&scope_key, key.to_string())
+        redis::Script::new(STATE_DELETE_SCRIPT)
+            .key(&keys.hash)
+            .key(&keys.active)
+            .key(&keys.phase)
+            .key(&keys.target)
+            .key(&keys.verify)
+            .arg(key)
+            .invoke_async::<i64>(&mut *conn)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to delete value from Redis: {}", e))?;
         Ok(())
@@ -204,6 +380,38 @@ impl StateAdapter for StateRedisAdapter {
             );
         }
         Ok(result)
+    }
+
+    async fn list_page(
+        &self,
+        scope: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<StateListPageResult> {
+        let keys = state_keys(scope);
+        let mut conn = self.publisher.lock().await;
+
+        let reconciliation: Vec<String> = redis::Script::new(STATE_RECONCILE_SCRIPT)
+            .key(&keys.hash)
+            .key(&keys.active)
+            .key(&keys.phase)
+            .key(&keys.cursor)
+            .key(&keys.target)
+            .key(&keys.verify)
+            .invoke_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to reconcile state pagination index: {}", e))?;
+        let values: Vec<String> = redis::Script::new(STATE_LIST_PAGE_SCRIPT)
+            .key(&keys.hash)
+            .key(&keys.active)
+            .arg(if cursor.is_some() { "1" } else { "0" })
+            .arg(cursor.unwrap_or_default())
+            .arg(limit)
+            .invoke_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to list state page: {}", e))?;
+        let _ = reconciliation;
+        decode_list_page_reply(values)
     }
 
     async fn list_groups(&self) -> anyhow::Result<Vec<String>> {
@@ -264,6 +472,209 @@ mod tests {
     async fn setup_test_adapter() -> StateRedisAdapter {
         let redis_url = "redis://localhost:6379".to_string();
         StateRedisAdapter::new(redis_url).await.unwrap()
+    }
+
+    async fn clear_pagination_scope(adapter: &StateRedisAdapter, scope: &str, extra: &[&str]) {
+        let keys = state_keys(scope);
+        let mut redis_keys = vec![
+            keys.hash,
+            keys.active,
+            keys.phase,
+            keys.cursor,
+            keys.target,
+            keys.verify,
+        ];
+        redis_keys.extend(extra.iter().map(|key| (*key).to_string()));
+        let mut conn = adapter.publisher.lock().await;
+        redis::cmd("DEL")
+            .arg(redis_keys)
+            .query_async::<i64>(&mut *conn)
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn pagination_scripts_maintain_fixed_score_indexes_atomically() {
+        for script in [STATE_SET_SCRIPT, STATE_DELETE_SCRIPT] {
+            assert!(script.contains("ZADD") || script.contains("ZREM"));
+            assert!(script.contains("KEYS[2]"));
+            assert!(script.contains("KEYS[4]"));
+            assert!(script.contains("KEYS[5]"));
+        }
+
+        let update_script = state_json_update_script();
+        assert!(update_script.contains("redis.call('HSET', key, field, new_value_str)"));
+        assert!(update_script.contains("redis.call('ZADD', active_index, 0, field)"));
+    }
+
+    #[test]
+    fn writes_cannot_bypass_exact_readiness_verification() {
+        assert!(!STATE_SET_SCRIPT.contains("'SET', KEYS[2]"));
+        assert!(!state_json_update_script().contains("'SET', KEYS[2]"));
+        assert!(STATE_RECONCILE_SCRIPT.contains("'SET', KEYS[2], KEYS[5]"));
+    }
+
+    #[test]
+    fn pagination_script_is_exclusive_bounded_and_fail_closed() {
+        assert!(STATE_LIST_PAGE_SCRIPT.contains("'(' .. ARGV[2]"));
+        assert!(STATE_LIST_PAGE_SCRIPT.contains("'LIMIT', 0, limit + 1"));
+        assert!(STATE_LIST_PAGE_SCRIPT.contains("index is not ready"));
+        assert!(!STATE_LIST_PAGE_SCRIPT.contains("HGETALL"));
+        assert!(!STATE_LIST_PAGE_SCRIPT.contains("HKEYS"));
+    }
+
+    #[test]
+    fn reconciliation_is_bounded_and_checks_exact_membership() {
+        assert!(STATE_RECONCILE_SCRIPT.contains("'HSCAN'"));
+        assert!(STATE_RECONCILE_SCRIPT.contains("'COUNT', 1000"));
+        assert!(STATE_RECONCILE_SCRIPT.contains("'ZDIFF'"));
+        assert!(STATE_RECONCILE_SCRIPT.contains("'HLEN'"));
+        assert!(STATE_RECONCILE_SCRIPT.contains("ZCARD"));
+        assert!(STATE_RECONCILE_SCRIPT.contains("'SET', KEYS[2], KEYS[5]"));
+        assert!(!STATE_RECONCILE_SCRIPT.contains("HGETALL"));
+        assert!(!STATE_RECONCILE_SCRIPT.contains("HKEYS"));
+    }
+
+    #[test]
+    fn index_keys_do_not_collide_with_state_scope_scan_namespace() {
+        let keys = state_keys("scope");
+        assert_eq!(keys.hash, "state:scope");
+        for key in [
+            keys.active,
+            keys.phase,
+            keys.cursor,
+            keys.target,
+            keys.verify,
+        ] {
+            assert!(!key.starts_with("state:"));
+        }
+    }
+
+    #[test]
+    fn list_page_reply_preserves_an_empty_next_cursor() {
+        let result = decode_list_page_reply(vec![
+            "true".to_string(),
+            "1".to_string(),
+            String::new(),
+            String::new(),
+            "1".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(result.next_cursor.as_deref(), Some(""));
+        assert_eq!(result.items[0].key, "");
+        assert_eq!(result.items[0].value, json!(1));
+    }
+
+    #[test]
+    fn state_keys_use_a_versioned_target_and_separate_active_pointer() {
+        let keys = state_keys("scope");
+        assert_eq!(keys.active, "iii:state-index-active:scope");
+        assert_eq!(keys.target, "iii:state-index:scope:v1");
+        assert_ne!(keys.active, keys.target);
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires Redis running
+    async fn test_list_page_reconciles_legacy_hash_and_round_trips_empty_cursor() {
+        let adapter = setup_test_adapter().await;
+        let scope = "test_list_page_legacy";
+        let keys = state_keys(scope);
+        clear_pagination_scope(&adapter, scope, &[]).await;
+
+        {
+            let mut conn = adapter.publisher.lock().await;
+            redis::cmd("HSET")
+                .arg(&keys.hash)
+                .arg("")
+                .arg("0")
+                .arg("a")
+                .arg("1")
+                .query_async::<i64>(&mut *conn)
+                .await
+                .unwrap();
+        }
+
+        let first_attempt = adapter.list_page(scope, None, 1).await;
+        assert!(first_attempt.is_err(), "first legacy build must fail closed");
+
+        let first_page = adapter.list_page(scope, None, 1).await.unwrap();
+        assert_eq!(first_page.items[0].key, "");
+        assert_eq!(first_page.next_cursor.as_deref(), Some(""));
+
+        let second_page = adapter.list_page(scope, Some(""), 1).await.unwrap();
+        assert_eq!(second_page.items[0].key, "a");
+        assert_eq!(second_page.next_cursor, None);
+
+        clear_pagination_scope(&adapter, scope, &[]).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires Redis running
+    async fn test_list_page_keeps_old_active_until_verified_target_is_published() {
+        let adapter = setup_test_adapter().await;
+        let scope = "test_list_page_rebuild";
+        let keys = state_keys(scope);
+        let old_index = "iii:state-index:test_list_page_rebuild:v0";
+        clear_pagination_scope(&adapter, scope, &[old_index]).await;
+
+        {
+            let mut conn = adapter.publisher.lock().await;
+            redis::cmd("HSET")
+                .arg(&keys.hash)
+                .arg("a")
+                .arg("1")
+                .query_async::<i64>(&mut *conn)
+                .await
+                .unwrap();
+            redis::cmd("ZADD")
+                .arg(old_index)
+                .arg(0)
+                .arg("a")
+                .query_async::<i64>(&mut *conn)
+                .await
+                .unwrap();
+            redis::cmd("SET")
+                .arg(&keys.active)
+                .arg(old_index)
+                .query_async::<String>(&mut *conn)
+                .await
+                .unwrap();
+        }
+
+        let rebuilding_page = adapter.list_page(scope, None, 10).await.unwrap();
+        assert_eq!(rebuilding_page.items[0].key, "a");
+
+        adapter.set(scope, "b", json!(2)).await.unwrap();
+        let active_page = adapter.list_page(scope, None, 10).await.unwrap();
+        assert_eq!(
+            active_page.items.iter().map(|item| item.key.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+
+        let active: String = {
+            let mut conn = adapter.publisher.lock().await;
+            redis::cmd("GET")
+                .arg(&keys.active)
+                .query_async(&mut *conn)
+                .await
+                .unwrap()
+        };
+        assert_eq!(active, keys.target);
+
+        adapter
+            .update(scope, "b", vec![UpdateOp::increment("", 1)])
+            .await
+            .unwrap();
+        let updated = adapter.list_page(scope, Some("a"), 10).await.unwrap();
+        assert_eq!(updated.items[0].value, json!(3));
+
+        adapter.delete(scope, "b").await.unwrap();
+        let deleted = adapter.list_page(scope, None, 10).await.unwrap();
+        assert_eq!(deleted.items.len(), 1);
+        assert_eq!(deleted.items[0].key, "a");
+
+        clear_pagination_scope(&adapter, scope, &[old_index]).await;
     }
 
     #[tokio::test]

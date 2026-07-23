@@ -6,7 +6,7 @@
 
 use iii_helpers::stream::UpdateOp;
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -50,6 +50,47 @@ pub struct StateUpdateInput {
 pub struct StateGetGroupInput {
     /// Namespace whose keys should be listed as a group.
     pub scope: String,
+}
+
+fn deserialize_non_null_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct StateListPageInput {
+    /// Namespace whose entries should be listed.
+    pub scope: String,
+    /// Opaque key token returned by the previous page. The bound is exclusive.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cursor: Option<String>,
+    /// Maximum number of entries to return. Defaults to 100 and must be 1..=1000.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct StateListPageItem {
+    pub key: String,
+    pub value: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct StateListPageResult {
+    pub items: Vec<StateListPageItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -155,5 +196,68 @@ mod tests {
             serde_json::from_value(json!({"scope": "s", "key": "k"})).unwrap();
         let _group: StateGetGroupInput = serde_json::from_value(json!({"scope": "s"})).unwrap();
         let _list: StateListGroupsInput = serde_json::from_value(json!({})).unwrap();
+    }
+
+    #[test]
+    fn state_list_page_wire_contract() {
+        let input: StateListPageInput = serde_json::from_value(json!({
+            "scope": "agents",
+            "cursor": "agent-100",
+            "limit": 25
+        }))
+        .unwrap();
+        assert_eq!(input.scope, "agents");
+        assert_eq!(input.cursor.as_deref(), Some("agent-100"));
+        assert_eq!(input.limit, Some(25));
+
+        let result = StateListPageResult {
+            items: vec![StateListPageItem {
+                key: "agent-101".to_string(),
+                value: json!({"status": "ready"}),
+            }],
+            next_cursor: Some("agent-101".to_string()),
+        };
+        assert_eq!(
+            serde_json::to_value(result).unwrap(),
+            json!({
+                "items": [{"key": "agent-101", "value": {"status": "ready"}}],
+                "next_cursor": "agent-101"
+            })
+        );
+    }
+
+    #[test]
+    fn state_list_page_omits_absent_optional_fields() {
+        let input: StateListPageInput = serde_json::from_value(json!({"scope": "agents"})).unwrap();
+        assert_eq!(input.cursor, None);
+        assert_eq!(input.limit, None);
+
+        let result = StateListPageResult {
+            items: Vec::new(),
+            next_cursor: None,
+        };
+        assert_eq!(serde_json::to_value(result).unwrap(), json!({"items": []}));
+    }
+
+    #[test]
+    fn state_list_page_rejects_explicit_null_optional_fields() {
+        for input in [
+            json!({"scope": "agents", "cursor": null}),
+            json!({"scope": "agents", "limit": null}),
+        ] {
+            assert!(serde_json::from_value::<StateListPageInput>(input).is_err());
+        }
+    }
+
+    #[test]
+    fn state_list_page_rejects_malformed_field_types() {
+        for input in [
+            json!({"scope": "agents", "cursor": 1}),
+            json!({"scope": "agents", "cursor": {}}),
+            json!({"scope": "agents", "limit": 1.5}),
+            json!({"scope": "agents", "limit": "1"}),
+        ] {
+            assert!(serde_json::from_value::<StateListPageInput>(input).is_err());
+        }
     }
 }

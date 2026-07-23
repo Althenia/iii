@@ -12,6 +12,8 @@ use async_trait::async_trait;
 use iii_helpers::stream::{StreamSetResult, StreamUpdateResult, UpdateOp};
 use serde_json::Value;
 
+use super::structs::StateListPageResult;
+
 #[async_trait]
 pub trait StateAdapter: Send + Sync {
     async fn set(&self, scope: &str, key: &str, value: Value) -> anyhow::Result<StreamSetResult>;
@@ -24,6 +26,14 @@ pub trait StateAdapter: Send + Sync {
         ops: Vec<UpdateOp>,
     ) -> anyhow::Result<StreamUpdateResult>;
     async fn list(&self, scope: &str) -> anyhow::Result<Vec<Value>>;
+    async fn list_page(
+        &self,
+        _scope: &str,
+        _cursor: Option<&str>,
+        _limit: usize,
+    ) -> anyhow::Result<StateListPageResult> {
+        anyhow::bail!("state pagination is not supported by this adapter")
+    }
     async fn list_groups(&self) -> anyhow::Result<Vec<String>>;
     async fn destroy(&self) -> anyhow::Result<()>;
 

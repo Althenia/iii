@@ -40,6 +40,29 @@ export type StateListInput = {
   scope: string
 }
 
+/** Input for listing a bounded page of keyed state values. */
+export type StateListPageInput = {
+  /** State scope (namespace). */
+  scope: string
+  /** Opaque exclusive cursor returned by the previous page. */
+  cursor?: string
+  /** Page size. Defaults to 100 and must be an integer from 1 through 1000. */
+  limit?: number
+}
+
+/** A keyed state value returned by {@link IState.listPage}. */
+export type StateListPageItem<TData> = {
+  key: string
+  value: TData
+}
+
+/** Result of listing a bounded page of keyed state values. */
+export type StateListPageResult<TData> = {
+  items: StateListPageItem<TData>[]
+  /** Opaque cursor for the next page. Omitted on the final page. */
+  next_cursor?: string
+}
+
 /** Result of a state set operation. */
 export type StateSetResult<TData> = {
   /** Previous value (if it existed). */
@@ -109,6 +132,13 @@ export interface IState {
   delete(input: StateDeleteInput): Promise<StateDeleteResult>
   /** List all values in a scope. */
   list<TData>(input: StateListInput): Promise<TData[]>
+  /**
+   * List keyed values in ascending UTF-8 bytewise key order.
+   *
+   * Pagination is weakly consistent: mutations between requests can change
+   * subsequent pages, and no snapshot guarantee is provided.
+   */
+  listPage?<TData>(input: StateListPageInput): Promise<StateListPageResult<TData>>
   /** Apply atomic update operations to a state value. */
   update<TData>(input: StateUpdateInput): Promise<StateUpdateResult<TData> | null>
 }

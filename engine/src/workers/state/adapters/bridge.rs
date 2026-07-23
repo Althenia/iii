@@ -19,7 +19,7 @@ use crate::{
         registry::{StateAdapterFuture, StateAdapterRegistration},
         structs::{
             StateDeleteInput, StateGetGroupInput, StateGetInput, StateListGroupsInput,
-            StateSetInput, StateUpdateInput,
+            StateListPageInput, StateListPageResult, StateSetInput, StateUpdateInput,
         },
     },
 };
@@ -35,6 +35,20 @@ impl BridgeAdapter {
         let bridge = Arc::new(register_worker(&bridge_url, InitOptions::default()));
 
         Ok(Self { bridge })
+    }
+}
+
+fn list_page_request(scope: &str, cursor: Option<&str>, limit: usize) -> TriggerRequest {
+    let data = StateListPageInput {
+        scope: scope.to_string(),
+        cursor: cursor.map(String::from),
+        limit: Some(limit),
+    };
+    TriggerRequest {
+        function_id: "state::list-page".to_string(),
+        payload: serde_json::to_value(data).unwrap_or(Value::Null),
+        action: None,
+        timeout_ms: None,
     }
 }
 
@@ -150,6 +164,22 @@ impl StateAdapter for BridgeAdapter {
             .map_err(|e| anyhow::anyhow!("Failed to deserialize list result: {}", e))
     }
 
+    async fn list_page(
+        &self,
+        scope: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<StateListPageResult> {
+        let result = self
+            .bridge
+            .trigger(list_page_request(scope, cursor, limit))
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to list page via bridge: {}", e))?;
+
+        serde_json::from_value(result)
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize list page result: {}", e))
+    }
+
     async fn list_groups(&self) -> anyhow::Result<Vec<String>> {
         let result = self
             .bridge
@@ -189,3 +219,18 @@ fn make_adapter(_engine: Arc<Engine>, config: Option<Value>) -> StateAdapterFutu
 }
 
 crate::register_adapter!(<StateAdapterRegistration> name: "bridge", make_adapter);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_page_request_forwards_exact_wire_contract() {
+        let request = list_page_request("scope", Some("cursor"), 25);
+        assert_eq!(request.function_id, "state::list-page");
+        assert_eq!(
+            request.payload,
+            serde_json::json!({"scope": "scope", "cursor": "cursor", "limit": 25})
+        );
+    }
+}

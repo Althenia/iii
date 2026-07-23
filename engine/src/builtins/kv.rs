@@ -191,6 +191,16 @@ pub struct BuiltinKvStore {
     default_interval: u64,
 }
 
+pub(crate) struct BuiltinKvPageItem {
+    pub key: String,
+    pub value: Value,
+}
+
+pub(crate) struct BuiltinKvPageResult {
+    pub items: Vec<BuiltinKvPageItem>,
+    pub next_cursor: Option<String>,
+}
+
 impl BuiltinKvStore {
     pub fn new(config: Option<Value>) -> Self {
         tracing::debug!("Initializing KvStore with config: {:?}", config);
@@ -569,6 +579,50 @@ impl BuiltinKvStore {
         store
             .get(&index)
             .map_or(vec![], |topic| topic.values().cloned().collect())
+    }
+
+    pub(crate) async fn list_page(
+        &self,
+        index: String,
+        cursor: Option<String>,
+        limit: usize,
+    ) -> anyhow::Result<BuiltinKvPageResult> {
+        if limit == 0 {
+            anyhow::bail!("list page limit must be greater than zero");
+        }
+
+        let store = self.store.read().await;
+        let Some(topic) = store.get(&index) else {
+            return Ok(BuiltinKvPageResult {
+                items: Vec::new(),
+                next_cursor: None,
+            });
+        };
+
+        let cursor = cursor.as_deref().map(str::as_bytes);
+        let mut keys: Vec<&String> = topic
+            .keys()
+            .filter(|key| cursor.is_none_or(|cursor| key.as_bytes() > cursor))
+            .collect();
+        keys.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        keys.truncate(limit.saturating_add(1));
+
+        let has_more = keys.len() > limit;
+        keys.truncate(limit);
+        let items = keys
+            .into_iter()
+            .map(|key| BuiltinKvPageItem {
+                key: key.clone(),
+                value: topic
+                    .get(key)
+                    .expect("key collected from the same locked map")
+                    .clone(),
+            })
+            .collect::<Vec<_>>();
+        let next_cursor =
+            has_more.then(|| items.last().expect("non-empty limited page").key.clone());
+
+        Ok(BuiltinKvPageResult { items, next_cursor })
     }
 
     pub async fn list_groups(&self) -> Vec<String> {
@@ -1389,6 +1443,134 @@ mod test {
         // Values must come back in insertion order
         let names: Vec<&str> = listed.iter().map(|v| v["name"].as_str().unwrap()).collect();
         assert_eq!(names, vec!["Charlie", "Alice", "Bob", "Diana", "Eve"]);
+    }
+
+    #[tokio::test]
+    async fn test_list_page_sorts_keys_bytewise_and_returns_values() {
+        let kv_store = BuiltinKvStore::new(None);
+        let index = "page_order";
+
+        for (key, value) in [
+            ("é", serde_json::json!("accent")),
+            ("z", serde_json::json!("ascii")),
+            ("😀", serde_json::json!("emoji")),
+            ("a", serde_json::json!("first")),
+        ] {
+            kv_store
+                .set(index.to_string(), key.to_string(), value)
+                .await;
+        }
+
+        let page = kv_store
+            .list_page(index.to_string(), None, 3)
+            .await
+            .unwrap();
+        let keys: Vec<&str> = page.items.iter().map(|item| item.key.as_str()).collect();
+        assert_eq!(keys, vec!["a", "z", "é"]);
+        assert_eq!(page.items[0].value, serde_json::json!("first"));
+        assert_eq!(page.next_cursor.as_deref(), Some("é"));
+    }
+
+    #[tokio::test]
+    async fn test_list_page_cursor_is_exclusive_and_final_page_omits_cursor() {
+        let kv_store = BuiltinKvStore::new(None);
+        for key in ["a", "b", "c"] {
+            kv_store
+                .set(
+                    "page_cursor".to_string(),
+                    key.to_string(),
+                    serde_json::json!(key),
+                )
+                .await;
+        }
+
+        let first = kv_store
+            .list_page("page_cursor".to_string(), None, 2)
+            .await
+            .unwrap();
+        assert_eq!(first.next_cursor.as_deref(), Some("b"));
+
+        let final_page = kv_store
+            .list_page("page_cursor".to_string(), first.next_cursor, 2)
+            .await
+            .unwrap();
+        assert_eq!(final_page.items.len(), 1);
+        assert_eq!(final_page.items[0].key, "c");
+        assert_eq!(final_page.next_cursor, None);
+    }
+
+    #[tokio::test]
+    async fn test_list_page_round_trips_empty_key_cursor() {
+        let kv_store = BuiltinKvStore::new(None);
+        for key in ["", "a"] {
+            kv_store
+                .set(
+                    "page_empty_cursor".to_string(),
+                    key.to_string(),
+                    serde_json::json!(key),
+                )
+                .await;
+        }
+
+        let first = kv_store
+            .list_page("page_empty_cursor".to_string(), None, 1)
+            .await
+            .unwrap();
+        assert_eq!(first.items[0].key, "");
+        assert_eq!(first.next_cursor.as_deref(), Some(""));
+
+        let second = kv_store
+            .list_page("page_empty_cursor".to_string(), first.next_cursor, 1)
+            .await
+            .unwrap();
+        assert_eq!(second.items[0].key, "a");
+        assert_eq!(second.next_cursor, None);
+    }
+
+    #[tokio::test]
+    async fn test_list_page_has_weak_consistency_across_mutations() {
+        let kv_store = BuiltinKvStore::new(None);
+        for key in ["a", "c", "e"] {
+            kv_store
+                .set(
+                    "page_mutation".to_string(),
+                    key.to_string(),
+                    serde_json::json!(key),
+                )
+                .await;
+        }
+
+        let first = kv_store
+            .list_page("page_mutation".to_string(), None, 2)
+            .await
+            .unwrap();
+        kv_store
+            .delete("page_mutation".to_string(), "c".to_string())
+            .await;
+        kv_store
+            .set(
+                "page_mutation".to_string(),
+                "d".to_string(),
+                serde_json::json!("d"),
+            )
+            .await;
+
+        let second = kv_store
+            .list_page("page_mutation".to_string(), first.next_cursor, 2)
+            .await
+            .unwrap();
+        let keys: Vec<&str> = second.items.iter().map(|item| item.key.as_str()).collect();
+        assert_eq!(keys, vec!["d", "e"]);
+
+        let legacy = kv_store.list("page_mutation".to_string()).await;
+        assert_eq!(
+            legacy,
+            vec![
+                serde_json::json!("a"),
+                serde_json::json!("e"),
+                serde_json::json!("d")
+            ]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

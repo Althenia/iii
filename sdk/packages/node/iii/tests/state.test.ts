@@ -1,5 +1,11 @@
 import { beforeEach, describe, expect, it } from 'vitest'
-import { StateEventType, type StateEventData, type StateSetResult } from '../src/state'
+import {
+  type IState,
+  StateEventType,
+  type StateEventData,
+  type StateListPageInput,
+  type StateSetResult,
+} from '../src/state'
 import type { UpdateAppend, UpdateOp } from '@iii-dev/helpers/stream'
 import type { FunctionRef, Trigger } from '../src/types'
 import { execute, iii, logger } from './utils'
@@ -9,6 +15,32 @@ type TestData = {
   value: number
   updated?: boolean
 }
+
+describe('State type contracts', () => {
+  it('keeps listPage additive for existing structural implementers', () => {
+    const legacyState: IState = {
+      get: async () => null,
+      set: async () => null,
+      delete: async () => ({}),
+      list: async () => [],
+      update: async () => null,
+    }
+
+    expect(legacyState.listPage).toBeUndefined()
+  })
+
+  it('exposes listPage with keyed generic values', async () => {
+    const state: Required<Pick<IState, 'listPage'>> = {
+      listPage: async <TData>(input: StateListPageInput) => ({
+        items: [{ key: input.cursor ?? 'first', value: { value: 1 } as TData }],
+      }),
+    }
+
+    const page = await state.listPage<{ value: number }>({ scope: 'scope', limit: 1 })
+    expect(page.items).toEqual([{ key: 'first', value: { value: 1 } }])
+    expect(page.next_cursor).toBeUndefined()
+  })
+})
 
 describe('State Operations', () => {
   const scope = 'test-scope'

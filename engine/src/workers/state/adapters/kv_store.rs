@@ -17,6 +17,7 @@ use crate::{
     workers::state::{
         adapters::StateAdapter,
         registry::{StateAdapterFuture, StateAdapterRegistration},
+        structs::{StateListPageItem, StateListPageResult},
     },
 };
 
@@ -72,6 +73,29 @@ impl StateAdapter for BuiltinKvStoreAdapter {
 
     async fn list(&self, scope: &str) -> anyhow::Result<Vec<Value>> {
         Ok(self.storage.list(scope.to_string()).await)
+    }
+
+    async fn list_page(
+        &self,
+        scope: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<StateListPageResult> {
+        let page = self
+            .storage
+            .list_page(scope.to_string(), cursor.map(String::from), limit)
+            .await?;
+        Ok(StateListPageResult {
+            items: page
+                .items
+                .into_iter()
+                .map(|item| StateListPageItem {
+                    key: item.key,
+                    value: item.value,
+                })
+                .collect(),
+            next_cursor: page.next_cursor,
+        })
     }
 
     async fn list_groups(&self) -> anyhow::Result<Vec<String>> {
@@ -165,6 +189,41 @@ mod tests {
         assert_eq!(list.len(), 2);
         assert!(list.contains(&data1));
         assert!(list.contains(&data2));
+    }
+
+    #[tokio::test]
+    async fn test_kv_store_adapter_list_page_contract() {
+        let adapter = BuiltinKvStoreAdapter::new(None);
+        for key in ["c", "a", "b"] {
+            adapter
+                .set("scope", key, serde_json::json!({"key": key}))
+                .await
+                .unwrap();
+        }
+
+        let first = adapter.list_page("scope", None, 2).await.unwrap();
+        assert_eq!(first.items[0].key, "a");
+        assert_eq!(first.items[0].value, serde_json::json!({"key": "a"}));
+        assert_eq!(first.next_cursor.as_deref(), Some("b"));
+
+        let final_page = adapter
+            .list_page("scope", first.next_cursor.as_deref(), 2)
+            .await
+            .unwrap();
+        assert_eq!(final_page.items.len(), 1);
+        assert_eq!(final_page.items[0].key, "c");
+        assert_eq!(final_page.next_cursor, None);
+    }
+
+    #[tokio::test]
+    async fn test_kv_store_adapter_rejects_zero_page_limit_without_panicking() {
+        let adapter = BuiltinKvStoreAdapter::new(None);
+        adapter
+            .set("scope", "key", serde_json::json!({"value": 1}))
+            .await
+            .unwrap();
+
+        assert!(adapter.list_page("scope", None, 0).await.is_err());
     }
 
     #[tokio::test]
