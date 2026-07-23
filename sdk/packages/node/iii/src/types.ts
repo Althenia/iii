@@ -232,6 +232,9 @@ export interface IIIClient {
   shutdown(): Promise<void>
 }
 
+/** Backward-compatible name for the public SDK client contract. */
+export type ISdk = IIIClient
+
 /**
  * Handle returned by {@link IIIClient.registerTrigger}. Use `unregister()` to
  * remove the trigger from the engine.
@@ -341,6 +344,9 @@ export type InternalHttpRequest<TBody = unknown> = {
   response: ChannelWriter
   request_body: ChannelReader
 }
+
+/** Backward-compatible name for an incoming API request. */
+export type ApiRequest<TBody = unknown> = Omit<InternalHttpRequest<TBody>, 'response'>
 
 /**
  * Response object passed to streaming function handlers. Use `status()` and

@@ -6,4 +6,4 @@ export type { EnqueueResult } from '@iii-dev/helpers/queue'
 
 export type { JsonValue, MiddlewareFunctionInput } from './iii-types'
 
-export type { IIIClient, StreamRequest, StreamResponse } from './types'
+export type { ApiRequest, IIIClient, ISdk, StreamRequest, StreamResponse } from './types'
